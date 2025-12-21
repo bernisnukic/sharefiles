@@ -1,0 +1,628 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Simple file uploader to an S3-compatible bucket (Cloudflare R2).
+
+usage() {
+  cat <<'USAGE'
+Usage: share <path-to-file> [object-key]
+
+Uploads a local file to an S3-compatible bucket and prints the public URL.
+
+Environment variables:
+  SHARE_BUCKET            Bucket name (e.g., your-bucket-name)
+  SHARE_ENDPOINT          S3 endpoint URL (e.g., https://<accountid>.r2.cloudflarestorage.com)
+  SHARE_BASE_URL          Public base URL (e.g., https://your-share-domain.example)
+  SHARE_REGION            AWS region (default: auto)
+  SHARE_STYLE             Request style: path or virtual (default: path)
+  SHARE_ACCESS_KEY_ID     Access key ID (required)
+  SHARE_SECRET_ACCESS_KEY Secret access key (required)
+  SHARE_SESSION_TOKEN     Optional session token
+  SHARE_PREFLIGHT         Run preflight checks (default: 1). Set to 0 to skip.
+  SHARE_CLIPBOARD         Copy share URL to clipboard (default: 1). Set to 0 to skip.
+  SHARE_CONTENT_TYPE      Content-Type header (default: auto, set to "none" to disable)
+  SHARE_CACHE_CONTROL     Cache-Control header
+  SHARE_CONTENT_DISPOSITION Content-Disposition header
+  SHARE_META              Custom metadata (key=value,key2=value2)
+  SHARE_RETRY_COUNT       Retry attempts for transient errors (default: 3; 0 to disable)
+  SHARE_RETRY_DELAY       Seconds between retries (default: 1)
+  SHARE_RETRY_MAX_TIME    Max seconds for all retries (default: 30)
+
+Examples:
+  share ./report.pdf
+  SHARE_PROFILE=r2 share "./my file.txt" my-file.txt
+USAGE
+}
+
+debug=false
+if [[ ${1:-} == "-d" || ${1:-} == "--debug" ]]; then
+  debug=true
+  shift
+fi
+
+if [[ ${1:-} == "-h" || ${1:-} == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+if [[ $# -lt 1 ]]; then
+  usage
+  exit 1
+fi
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+load_env_file() {
+  local env_file="$1" line key value
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    # Trim leading/trailing whitespace.
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -z "$line" || "${line:0:1}" == "#" ]] && continue
+    if [[ "$line" == export\ * ]]; then
+      line="${line#export }"
+    fi
+    if [[ "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
+      key="${line%%=*}"
+      value="${line#*=}"
+      if [[ "${value:0:1}" == "\"" && "${value: -1}" == "\"" ]]; then
+        value="${value:1:-1}"
+      elif [[ "${value:0:1}" == "'" && "${value: -1}" == "'" ]]; then
+        value="${value:1:-1}"
+      fi
+      export "$key=$value"
+    fi
+  done < "$env_file"
+}
+
+if [[ -f "$script_dir/.env" ]]; then
+  load_env_file "$script_dir/.env"
+fi
+
+path="$1"
+if [[ ! -f "$path" ]]; then
+  echo "Error: file not found: $path" >&2
+  exit 1
+fi
+
+bucket="${SHARE_BUCKET:-your-bucket-name}"
+endpoint="${SHARE_ENDPOINT:-https://<accountid>.r2.cloudflarestorage.com}"
+base_url="${SHARE_BASE_URL:-https://your-share-domain.example}"
+region="${SHARE_REGION:-auto}"
+style="${SHARE_STYLE:-path}"
+access_key="${SHARE_ACCESS_KEY_ID:-}"
+secret_key="${SHARE_SECRET_ACCESS_KEY:-}"
+session_token="${SHARE_SESSION_TOKEN:-}"
+preflight="${SHARE_PREFLIGHT:-1}"
+clipboard="${SHARE_CLIPBOARD:-1}"
+content_type="${SHARE_CONTENT_TYPE:-auto}"
+cache_control="${SHARE_CACHE_CONTROL:-}"
+content_disposition="${SHARE_CONTENT_DISPOSITION:-}"
+meta="${SHARE_META:-}"
+retry_count="${SHARE_RETRY_COUNT:-3}"
+retry_delay="${SHARE_RETRY_DELAY:-1}"
+retry_max_time="${SHARE_RETRY_MAX_TIME:-30}"
+progress_enabled=false
+if [[ -t 2 ]]; then
+  progress_enabled=true
+fi
+
+if [[ "$access_key" == "YOUR_ACCESS_KEY_ID" || "$secret_key" == "YOUR_SECRET_ACCESS_KEY" ]]; then
+  echo "Error: replace placeholder access keys in .env with real values." >&2
+  exit 1
+fi
+if [[ "$session_token" == "YOUR_SESSION_TOKEN" ]]; then
+  session_token=""
+fi
+
+if [[ -z "$access_key" || -z "$secret_key" ]]; then
+  echo "Error: SHARE_ACCESS_KEY_ID and SHARE_SECRET_ACCESS_KEY must be set." >&2
+  exit 1
+fi
+if [[ -z "$endpoint" || ! "$endpoint" =~ ^https?:// ]]; then
+  echo "Error: SHARE_ENDPOINT must start with http:// or https://." >&2
+  exit 1
+fi
+if [[ "$endpoint" == *"<"* || "$endpoint" == *">"* ]]; then
+  echo "Error: SHARE_ENDPOINT contains placeholder text; replace <accountid> with your real account id." >&2
+  exit 1
+fi
+if [[ "$bucket" == "your-bucket-name" || -z "$bucket" ]]; then
+  echo "Error: SHARE_BUCKET is not set to a real bucket name." >&2
+  exit 1
+fi
+if [[ -z "$base_url" || "$base_url" == *"your-share-domain.example"* ]]; then
+  echo "Error: SHARE_BASE_URL is not set to a real public base URL." >&2
+  exit 1
+fi
+if [[ "$style" != "path" && "$style" != "virtual" ]]; then
+  echo "Error: SHARE_STYLE must be 'path' or 'virtual'." >&2
+  exit 1
+fi
+if ! [[ "$retry_count" =~ ^[0-9]+$ ]]; then
+  echo "Error: SHARE_RETRY_COUNT must be a non-negative integer." >&2
+  exit 1
+fi
+if ! [[ "$retry_delay" =~ ^[0-9]+$ ]]; then
+  echo "Error: SHARE_RETRY_DELAY must be a non-negative integer." >&2
+  exit 1
+fi
+if ! [[ "$retry_max_time" =~ ^[0-9]+$ ]]; then
+  echo "Error: SHARE_RETRY_MAX_TIME must be a non-negative integer." >&2
+  exit 1
+fi
+
+# Normalize endpoint to scheme://host with no path.
+scheme="https"
+if [[ "$endpoint" == http://* ]]; then
+  scheme="http"
+fi
+host="${endpoint#https://}"
+host="${host#http://}"
+host="${host%%/*}"
+endpoint="${scheme}://${host}"
+
+object_key="${2:-$(basename "$path")}"
+if [[ -z "$object_key" ]]; then
+  echo "Error: object key is empty." >&2
+  exit 1
+fi
+
+uri_encode() {
+  local input="$1" output="" char hex
+  local i
+  LC_ALL=C
+  for ((i=0; i<${#input}; i++)); do
+    char="${input:i:1}"
+    case "$char" in
+      [a-zA-Z0-9.~_-]) output+="$char" ;;
+      *) printf -v hex '%02X' "'$char"; output+="%$hex" ;;
+    esac
+  done
+  printf '%s' "$output"
+}
+
+encode_path() {
+  local input="$1" output="" part
+  local IFS='/'
+  read -r -a parts <<< "$input"
+  for part in "${parts[@]}"; do
+    if [[ -n "$output" ]]; then
+      output+="/"
+    fi
+    output+="$(uri_encode "$part")"
+  done
+  printf '%s' "$output"
+}
+
+normalize_header_value() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  value="$(printf '%s' "$value" | tr -s '[:space:]' ' ')"
+  printf '%s' "$value"
+}
+
+detect_content_type() {
+  local path="$1"
+  if command -v file >/dev/null 2>&1; then
+    file -b --mime-type "$path" 2>/dev/null
+  fi
+}
+
+build_canonical_headers() {
+  local -a headers=("$@")
+  local -a sorted
+  local entry name value
+
+  sorted=()
+  while IFS= read -r entry; do
+    sorted+=("$entry")
+  done < <(printf '%s\n' "${headers[@]}" | LC_ALL=C sort -t: -k1,1)
+  canonical_headers=""
+  signed_headers=""
+  for entry in "${sorted[@]}"; do
+    name="${entry%%:*}"
+    value="${entry#*:}"
+    if [[ -n "$canonical_headers" ]]; then
+      canonical_headers+=$'\n'
+    fi
+    canonical_headers+="${name}:${value}"
+    if [[ -n "$signed_headers" ]]; then
+      signed_headers+=";"
+    fi
+    signed_headers+="$name"
+  done
+}
+
+if [[ "$content_type" == "auto" ]]; then
+  content_type="$(detect_content_type "$path")"
+elif [[ "$content_type" == "none" ]]; then
+  content_type=""
+fi
+
+format_speed() {
+  local bps="$1"
+  awk -v bps="$bps" 'BEGIN {
+    if (bps < 1024) { printf "%.0f B/s", bps; }
+    else if (bps < 1024*1024) { printf "%.1f KB/s", bps/1024; }
+    else if (bps < 1024*1024*1024) { printf "%.1f MB/s", bps/1024/1024; }
+    else { printf "%.1f GB/s", bps/1024/1024/1024; }
+  }'
+}
+
+format_bytes() {
+  local bytes="$1"
+  awk -v bytes="$bytes" 'BEGIN {
+    if (bytes < 1024) { printf "%.0f B", bytes; }
+    else if (bytes < 1024*1024) { printf "%.1f KB", bytes/1024; }
+    else if (bytes < 1024*1024*1024) { printf "%.1f MB", bytes/1024/1024; }
+    else { printf "%.1f GB", bytes/1024/1024/1024; }
+  }'
+}
+
+format_eta() {
+  local seconds="$1"
+  if [[ -z "$seconds" || "$seconds" -le 0 ]]; then
+    printf -- "--:--"
+    return
+  fi
+  if [[ "$seconds" -ge 3600 ]]; then
+    printf '%02d:%02d:%02d' "$((seconds / 3600))" "$(((seconds / 60) % 60))" "$((seconds % 60))"
+  else
+    printf '%02d:%02d' "$((seconds / 60))" "$((seconds % 60))"
+  fi
+}
+
+file_size() {
+  local path="$1"
+  if stat -f%z "$path" >/dev/null 2>&1; then
+    stat -f%z "$path"
+  else
+    stat -c%s "$path"
+  fi
+}
+
+progress_tui() {
+  local total_bytes="$1"
+  local start_time now elapsed percent sent_bytes speed remaining eta bar_width filled_count empty_count filled empty line
+  bar_width=28
+  start_time="$(date +%s)"
+
+  while IFS= read -r -d $'\r' line || [[ -n "$line" ]]; do
+    line="${line//$'\n'/}"
+    if [[ "$line" =~ ([0-9]+(\.[0-9]+)?)% ]]; then
+      percent="${BASH_REMATCH[1]}"
+      sent_bytes="$(awk -v total="$total_bytes" -v pct="$percent" 'BEGIN { printf "%.0f", total * pct / 100 }')"
+      now="$(date +%s)"
+      elapsed=$((now - start_time))
+      if [[ "$elapsed" -lt 1 ]]; then
+        elapsed=1
+      fi
+      speed="$(awk -v bytes="$sent_bytes" -v t="$elapsed" 'BEGIN { printf "%.0f", bytes / t }')"
+      remaining=$((total_bytes - sent_bytes))
+      if [[ "$remaining" -lt 0 ]]; then
+        remaining=0
+      fi
+      if [[ "$speed" -gt 0 ]]; then
+        eta=$((remaining / speed))
+      else
+        eta=0
+      fi
+      filled_count="$(awk -v pct="$percent" -v w="$bar_width" 'BEGIN { printf "%d", (pct/100)*w }')"
+      if [[ "$filled_count" -lt 0 ]]; then
+        filled_count=0
+      fi
+      if [[ "$filled_count" -gt "$bar_width" ]]; then
+        filled_count="$bar_width"
+      fi
+      empty_count=$((bar_width - filled_count))
+      filled="$(printf '%*s' "$filled_count" '' | tr ' ' '=')"
+      empty="$(printf '%*s' "$empty_count" '' | tr ' ' '-')"
+      printf "\rUPLOAD [%s%s] %5.1f%%  %s / %s  %s  ETA %s" \
+        "$filled" "$empty" "$percent" \
+        "$(format_bytes "$sent_bytes")" "$(format_bytes "$total_bytes")" \
+        "$(format_speed "$speed")" "$(format_eta "$eta")" >&2
+    elif [[ -n "$line" ]]; then
+      printf "\n%s\n" "$line" >&2
+    fi
+  done
+  printf "\n" >&2
+}
+
+http_head_status() {
+  local url="$1" status curl_status
+  set +e
+  status="$(curl --silent --show-error --max-time 10 --connect-timeout 5 -I "$url" --write-out "%{http_code}" --output /dev/null)"
+  curl_status=$?
+  set -e
+  if [[ $curl_status -ne 0 ]]; then
+    printf ''
+    return "$curl_status"
+  fi
+  printf '%s' "$status"
+}
+
+preflight_check() {
+  local endpoint_status base_status test_key encoded_test_key request_url tmp_body status curl_status
+  local curl_headers
+
+  endpoint_status="$(http_head_status "$endpoint")" || true
+  if [[ -z "$endpoint_status" || "$endpoint_status" == "000" ]]; then
+    echo "Error: failed to reach SHARE_ENDPOINT: $endpoint" >&2
+    exit 1
+  fi
+
+  test_key="__share_preflight__$(date -u +%Y%m%dT%H%M%SZ)"
+  encoded_test_key="$(encode_path "$test_key")"
+  if [[ "$style" == "virtual" ]]; then
+    request_url="${scheme}://${bucket}.${host}/${encoded_test_key}"
+  else
+    request_url="${endpoint}/${encoded_bucket}/${encoded_test_key}"
+  fi
+
+  tmp_body="$(mktemp)"
+  curl_headers=(
+    -H "x-amz-content-sha256: UNSIGNED-PAYLOAD"
+  )
+  if [[ -n "$session_token" ]]; then
+    curl_headers+=(-H "x-amz-security-token: ${session_token}")
+  fi
+
+  set +e
+  status="$(curl --silent --show-error --max-time 10 --connect-timeout 5 --request GET --aws-sigv4 "aws:amz:${region}:s3" --user "${access_key}:${secret_key}" "${curl_headers[@]}" "${request_url}" --output "$tmp_body" --write-out "%{http_code}")"
+  curl_status=$?
+  set -e
+
+  if [[ $curl_status -ne 0 ]]; then
+    echo "Error: preflight request failed (curl exit $curl_status)." >&2
+    if [[ -s "$tmp_body" ]]; then
+      echo "Response:" >&2
+      cat "$tmp_body" >&2
+    fi
+    rm -f "$tmp_body"
+    exit "$curl_status"
+  fi
+
+  if [[ "$status" == "403" ]]; then
+    echo "Error: preflight access denied for bucket '$bucket'." >&2
+    if [[ -s "$tmp_body" ]]; then
+      echo "Response:" >&2
+      cat "$tmp_body" >&2
+    fi
+    rm -f "$tmp_body"
+    exit 1
+  fi
+
+  if [[ "$status" != "404" && "$status" != "200" ]]; then
+    echo "Warning: preflight request returned HTTP $status." >&2
+    if [[ -s "$tmp_body" ]]; then
+      echo "Response:" >&2
+      cat "$tmp_body" >&2
+    fi
+  fi
+  rm -f "$tmp_body"
+
+  if [[ -n "$base_url" ]]; then
+    base_status="$(http_head_status "$base_url")" || true
+    if [[ -z "$base_status" || "$base_status" == "000" ]]; then
+      echo "Warning: could not reach SHARE_BASE_URL: $base_url" >&2
+    elif [[ "$base_status" == "403" ]]; then
+      echo "Warning: SHARE_BASE_URL returned 403 (bucket may not be public)." >&2
+    elif [[ "$base_status" =~ ^5 ]]; then
+      echo "Warning: SHARE_BASE_URL returned HTTP $base_status." >&2
+    fi
+  fi
+}
+
+payload_hash="$(openssl dgst -sha256 "$path" | awk '{print $2}')"
+amz_date="$(date -u +"%Y%m%dT%H%M%SZ")"
+date_stamp="$(date -u +"%Y%m%d")"
+total_bytes="$(file_size "$path" 2>/dev/null || true)"
+if [[ -z "$total_bytes" ]]; then
+  total_bytes=0
+fi
+
+encoded_bucket="$(encode_path "$bucket")"
+encoded_key="$(encode_path "$object_key")"
+host_for_sig="$host"
+if [[ "$style" == "virtual" ]]; then
+  host_for_sig="${bucket}.${host}"
+  canonical_uri="/${encoded_key}"
+  upload_url="${scheme}://${host_for_sig}/${encoded_key}"
+else
+  canonical_uri="/$encoded_bucket/$encoded_key"
+  upload_url="${endpoint}/${encoded_bucket}/${encoded_key}"
+fi
+
+if [[ "$preflight" != "0" ]]; then
+  preflight_check
+fi
+
+header_entries=(
+  "host:${host_for_sig}"
+  "x-amz-content-sha256:${payload_hash}"
+  "x-amz-date:${amz_date}"
+)
+
+session_token_norm=""
+content_type_norm=""
+cache_control_norm=""
+content_disposition_norm=""
+meta_headers=()
+
+if [[ -n "$session_token" ]]; then
+  session_token_norm="$(normalize_header_value "$session_token")"
+  header_entries+=("x-amz-security-token:${session_token_norm}")
+fi
+if [[ -n "$content_type" ]]; then
+  content_type_norm="$(normalize_header_value "$content_type")"
+  header_entries+=("content-type:${content_type_norm}")
+fi
+if [[ -n "$cache_control" ]]; then
+  cache_control_norm="$(normalize_header_value "$cache_control")"
+  header_entries+=("cache-control:${cache_control_norm}")
+fi
+if [[ -n "$content_disposition" ]]; then
+  content_disposition_norm="$(normalize_header_value "$content_disposition")"
+  header_entries+=("content-disposition:${content_disposition_norm}")
+fi
+
+if [[ -n "$meta" ]]; then
+  IFS=',' read -r -a meta_pairs <<< "$meta"
+  for pair in "${meta_pairs[@]}"; do
+    pair="${pair#"${pair%%[![:space:]]*}"}"
+    pair="${pair%"${pair##*[![:space:]]}"}"
+    [[ -z "$pair" ]] && continue
+    if [[ "$pair" != *"="* ]]; then
+      echo "Warning: invalid SHARE_META entry (missing '='): $pair" >&2
+      continue
+    fi
+    key="${pair%%=*}"
+    value="${pair#*=}"
+    key="${key#"${key%%[![:space:]]*}"}"
+    key="${key%"${key##*[![:space:]]}"}"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    if [[ -z "$key" ]]; then
+      echo "Warning: invalid SHARE_META entry (empty key)." >&2
+      continue
+    fi
+    key_lc="$(printf '%s' "$key" | tr '[:upper:]' '[:lower:]')"
+    if [[ ! "$key_lc" =~ ^[a-z0-9][a-z0-9._-]*$ ]]; then
+      echo "Warning: invalid SHARE_META key: $key" >&2
+      continue
+    fi
+    meta_headers+=("x-amz-meta-${key_lc}:$(normalize_header_value "$value")")
+  done
+  if [[ ${#meta_headers[@]} -gt 0 ]]; then
+    header_entries+=("${meta_headers[@]}")
+  fi
+fi
+
+build_canonical_headers "${header_entries[@]}"
+
+canonical_request="PUT\n${canonical_uri}\n\n${canonical_headers}\n\n${signed_headers}\n${payload_hash}"
+canonical_request_hash="$(printf '%b' "$canonical_request" | openssl dgst -sha256 | awk '{print $2}')"
+
+credential_scope="${date_stamp}/${region}/s3/aws4_request"
+string_to_sign="AWS4-HMAC-SHA256\n${amz_date}\n${credential_scope}\n${canonical_request_hash}"
+
+hmac_sha256_hex() {
+  local key="$1"
+  local data="$2"
+  local key_type="${3:-str}"
+  if [[ "$key_type" == "hex" ]]; then
+    printf '%b' "$data" | openssl dgst -sha256 -mac HMAC -macopt hexkey:"$key" | awk '{print $2}'
+  else
+    printf '%b' "$data" | openssl dgst -sha256 -mac HMAC -macopt key:"$key" | awk '{print $2}'
+  fi
+}
+
+k_date="$(hmac_sha256_hex "AWS4${secret_key}" "$date_stamp" "str")"
+k_region="$(hmac_sha256_hex "$k_date" "$region" "hex")"
+k_service="$(hmac_sha256_hex "$k_region" "s3" "hex")"
+k_signing="$(hmac_sha256_hex "$k_service" "aws4_request" "hex")"
+signature="$(hmac_sha256_hex "$k_signing" "$string_to_sign" "hex")"
+
+authorization_header="AWS4-HMAC-SHA256 Credential=${access_key}/${credential_scope}, SignedHeaders=${signed_headers}, Signature=${signature}"
+
+if $debug; then
+  echo "=== DEBUG ===" >&2
+  echo "Upload URL: ${upload_url}" >&2
+  echo "Host for signature: ${host_for_sig}" >&2
+  echo "Canonical URI: ${canonical_uri}" >&2
+  echo "Date: ${amz_date}" >&2
+  echo "Payload hash: ${payload_hash}" >&2
+  echo "" >&2
+  echo "--- Canonical Request ---" >&2
+  printf '%b' "$canonical_request" >&2
+  echo "" >&2
+  echo "--- End Canonical Request ---" >&2
+  echo "" >&2
+  echo "Canonical Request Hash: ${canonical_request_hash}" >&2
+  echo "" >&2
+  echo "--- String to Sign ---" >&2
+  printf '%b' "$string_to_sign" >&2
+  echo "" >&2
+  echo "--- End String to Sign ---" >&2
+  echo "" >&2
+  echo "Signature: ${signature}" >&2
+  echo "Authorization: ${authorization_header}" >&2
+  echo "===============" >&2
+fi
+
+curl_headers=(
+  -H "Authorization: ${authorization_header}"
+  -H "x-amz-content-sha256: ${payload_hash}"
+  -H "x-amz-date: ${amz_date}"
+)
+if [[ -n "$session_token_norm" ]]; then
+  curl_headers+=(-H "x-amz-security-token: ${session_token_norm}")
+fi
+if [[ -n "$content_type_norm" ]]; then
+  curl_headers+=(-H "Content-Type: ${content_type_norm}")
+fi
+if [[ -n "$cache_control_norm" ]]; then
+  curl_headers+=(-H "Cache-Control: ${cache_control_norm}")
+fi
+if [[ -n "$content_disposition_norm" ]]; then
+  curl_headers+=(-H "Content-Disposition: ${content_disposition_norm}")
+fi
+if [[ ${#meta_headers[@]} -gt 0 ]]; then
+  for meta_header in "${meta_headers[@]}"; do
+    curl_headers+=(-H "${meta_header%%:*}: ${meta_header#*:}")
+  done
+fi
+
+curl_retry_args=()
+if [[ "$retry_count" -gt 0 ]]; then
+  curl_retry_args=(--retry "$retry_count" --retry-delay "$retry_delay" --retry-max-time "$retry_max_time" --retry-connrefused)
+fi
+
+tmp_body="$(mktemp)"
+set +e
+if $progress_enabled; then
+  curl_output="$(curl --progress-bar --show-error --request PUT --upload-file "$path" "${upload_url}" "${curl_headers[@]}" "${curl_retry_args[@]}" --output "$tmp_body" --write-out "%{http_code}" 2> >(progress_tui "$total_bytes"))"
+else
+  curl_output="$(curl --silent --show-error --request PUT --upload-file "$path" "${upload_url}" "${curl_headers[@]}" "${curl_retry_args[@]}" --output "$tmp_body" --write-out "%{http_code}")"
+fi
+curl_status=$?
+set -e
+if [[ $curl_status -ne 0 ]]; then
+  echo "Error: upload failed (curl exit $curl_status)." >&2
+  if [[ -s "$tmp_body" ]]; then
+    echo "Response:" >&2
+    cat "$tmp_body" >&2
+  fi
+  rm -f "$tmp_body"
+  exit "$curl_status"
+fi
+read -r http_code <<<"$curl_output"
+if [[ "$http_code" != "200" ]]; then
+  echo "Error: upload failed (HTTP $http_code)." >&2
+  if [[ -s "$tmp_body" ]]; then
+    echo "Response:" >&2
+    cat "$tmp_body" >&2
+  fi
+  rm -f "$tmp_body"
+  exit 1
+fi
+rm -f "$tmp_body"
+
+# Print shareable URL.
+if [[ "$base_url" == */ ]]; then
+  share_url="${base_url}${encoded_key}"
+else
+  share_url="${base_url}/${encoded_key}"
+fi
+
+if [[ "$clipboard" != "0" ]]; then
+  if command -v pbcopy >/dev/null 2>&1; then
+    printf '%s' "$share_url" | pbcopy
+    echo "Copied to clipboard." >&2
+  else
+    echo "Warning: pbcopy not available; clipboard copy skipped." >&2
+  fi
+fi
+
+echo "$share_url"
