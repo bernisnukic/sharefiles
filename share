@@ -887,12 +887,31 @@ else
   share_url="${base_url}/${encoded_key}"
 fi
 
-if [[ "$clipboard" != "0" ]]; then
+copy_to_clipboard() {
+  local text="$1"
   if command -v pbcopy >/dev/null 2>&1; then
-    printf '%s' "$share_url" | pbcopy
+    printf '%s' "$text" | pbcopy && return 0
+  fi
+  if [[ -n "${WAYLAND_DISPLAY:-}" ]] && command -v wl-copy >/dev/null 2>&1; then
+    printf '%s' "$text" | wl-copy && return 0
+  fi
+  if command -v xclip >/dev/null 2>&1; then
+    printf '%s' "$text" | xclip -selection clipboard && return 0
+  fi
+  if command -v xsel >/dev/null 2>&1; then
+    printf '%s' "$text" | xsel --clipboard --input && return 0
+  fi
+  if command -v clip.exe >/dev/null 2>&1; then
+    printf '%s' "$text" | clip.exe && return 0
+  fi
+  return 1
+}
+
+if [[ "$clipboard" != "0" ]]; then
+  if copy_to_clipboard "$share_url"; then
     echo "Copied to clipboard." >&2
   else
-    echo "Warning: pbcopy not available; clipboard copy skipped." >&2
+    echo "Warning: no clipboard tool found (tried pbcopy, wl-copy, xclip, xsel, clip.exe); skipping." >&2
   fi
 fi
 

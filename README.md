@@ -1,6 +1,16 @@
 # sharefiles
 
+[![shellcheck](https://github.com/bernisnukic/sharefiles/actions/workflows/shellcheck.yml/badge.svg)](https://github.com/bernisnukic/sharefiles/actions/workflows/shellcheck.yml)
+
 Tiny CLI to upload a file to an S3-compatible bucket (Cloudflare R2) and print a shareable URL.
+
+## Why this exists
+
+`aws s3 cp` and `rclone copy` already upload files to S3. But for the specific case of *upload a file, get a public URL, copy it to my clipboard* they're heavyweight — `awscli` is a ~100 MB Python install, `rclone` is a Go binary with global config to wire up. This is one Bash file you can drop into your `$PATH`, with zero dependencies beyond what already ships on macOS and every mainstream Linux distro. The whole script is auditable in one sitting, which matters when you're shipping it credentials.
+
+It's tuned for Cloudflare R2 (default region `auto`, path-style requests, custom-domain share URLs) but works against any S3-compatible endpoint. Multipart upload, retries, preflight checks, content-type detection, and clipboard integration are all built in — features that are normally a separate piece of plumbing on top of a generic S3 client.
+
+**Non-goals:** it's not a general-purpose S3 CLI. No `ls`/`rm`/`mv`, no upload resumption mid-transfer (a failed multipart aborts; just re-run), no parallel part uploads.
 
 ## Features
 
@@ -10,13 +20,14 @@ Tiny CLI to upload a file to an S3-compatible bucket (Cloudflare R2) and print a
 - **Multipart upload** for files larger than 4 GiB (configurable), with overall progress bar and clean abort on failure or Ctrl+C
 - Optional metadata headers (Content-Type, Cache-Control, Content-Disposition, custom `x-amz-meta-*`)
 - Preflight checks and retries for production use
-- Copies the share URL to your clipboard (macOS `pbcopy`)
+- Copies the share URL to your clipboard (auto-detects `pbcopy` on macOS, `wl-copy`/`xclip`/`xsel` on Linux, `clip.exe` on WSL)
 - Works correctly when symlinked into your `$PATH` (resolves the real script location to find `.env`)
 
 ## Requirements
 
-- macOS with `bash`, `curl`, `openssl` (defaults)
+- `bash` 3.2+, `curl`, `openssl`, `awk`, `dd` (preinstalled on macOS and almost every Linux distro)
 - `file` (optional, used to auto-detect Content-Type)
+- For clipboard copy: `pbcopy` (macOS), `wl-copy`/`xclip`/`xsel` (Linux), or `clip.exe` (WSL). Optional — set `SHARE_CLIPBOARD=0` to skip.
 
 ## Install
 
