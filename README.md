@@ -7,9 +7,11 @@ Tiny CLI to upload a file to an S3-compatible bucket (Cloudflare R2) and print a
 - Single-file Bash script (no external dependencies beyond macOS defaults)
 - AWS Signature V4 signing for S3-compatible endpoints
 - TUI progress meter with percent, speed, and ETA
+- **Multipart upload** for files larger than 4 GiB (configurable), with overall progress bar and clean abort on failure or Ctrl+C
 - Optional metadata headers (Content-Type, Cache-Control, Content-Disposition, custom `x-amz-meta-*`)
 - Preflight checks and retries for production use
 - Copies the share URL to your clipboard (macOS `pbcopy`)
+- Works correctly when symlinked into your `$PATH` (resolves the real script location to find `.env`)
 
 ## Requirements
 
@@ -36,11 +38,14 @@ ln -s "$(pwd)/share" /usr/local/bin/share
 ./share <path-to-file> [object-key]
 ```
 
+Pass `-d` or `--debug` as the first argument to print the canonical request, string-to-sign, and computed signature for every signed request — handy when troubleshooting `SignatureDoesNotMatch`.
+
 Examples:
 
 ```bash
 ./share ./report.pdf
 ./share "./my file.txt" my-file.txt
+./share -d ./large.zip
 ```
 
 Object keys are URL-encoded in the output URL.
@@ -81,6 +86,8 @@ The share URL is constructed from `SHARE_BASE_URL` plus the object key, so it mu
 | `SHARE_RETRY_COUNT` | No | `3` | Retry attempts for transient failures (`0` to disable). |
 | `SHARE_RETRY_DELAY` | No | `1` | Seconds between retries. |
 | `SHARE_RETRY_MAX_TIME` | No | `30` | Max seconds for all retries. |
+| `SHARE_MULTIPART_THRESHOLD` | No | `4294967296` (4 GiB) | File size in bytes at which the script switches from single PUT to multipart upload. |
+| `SHARE_PART_SIZE` | No | `104857600` (100 MiB) | Multipart chunk size in bytes. Minimum 5 MiB (S3 requirement); max ~5 GiB. |
 
 ## Metadata
 
@@ -107,7 +114,22 @@ When `SHARE_PREFLIGHT=1`, the script:
 
 ## Retries
 
-Retries are enabled by default with `SHARE_RETRY_COUNT=3`. This helps with transient network errors and 5xx responses.
+Retries are enabled by default with `SHARE_RETRY_COUNT=3`. This helps with transient network errors and 5xx responses. (Retries apply to the single-PUT path; multipart uploads handle failure by aborting the upload — re-run the script to try again.)
+
+## Large files (multipart upload)
+
+Files larger than `SHARE_MULTIPART_THRESHOLD` (default 4 GiB) are uploaded using S3 multipart upload — the script splits the file into chunks of `SHARE_PART_SIZE` (default 100 MiB), uploads them sequentially, and completes the upload at the end. If anything fails or you interrupt the script with Ctrl+C, the in-flight multipart upload is aborted to avoid leaving orphaned parts in your bucket.
+
+The progress bar shows overall progress across the whole file plus the current part number, updating every second as each chunk uploads:
+
+```
+██████████░░░░░░░░░░░░░░░░░░░░  34.3%  Part 19/54  1.8 GB / 5.3 GB  2.2 MB/s  ETA 26:51
+```
+
+Tuning notes:
+
+- `SHARE_PART_SIZE` minimum is 5 MiB (an S3 requirement); maximum part size is ~5 GiB. Smaller chunks = more requests but a finer retry boundary; larger chunks = fewer requests but more wasted bandwidth on a single part failure.
+- `SHARE_MULTIPART_THRESHOLD` controls when multipart kicks in. Single PUT works up to ~5 GiB on R2, so the default 4 GiB leaves comfortable headroom.
 
 ## Troubleshooting
 

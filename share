@@ -27,6 +27,8 @@ Environment variables:
   SHARE_RETRY_COUNT       Retry attempts for transient errors (default: 3; 0 to disable)
   SHARE_RETRY_DELAY       Seconds between retries (default: 1)
   SHARE_RETRY_MAX_TIME    Max seconds for all retries (default: 30)
+  SHARE_MULTIPART_THRESHOLD Bytes at which to switch to multipart (default: 4294967296 = 4 GiB)
+  SHARE_PART_SIZE         Multipart chunk size in bytes (default: 104857600 = 100 MiB; min 5 MiB)
 
 Examples:
   share ./report.pdf
@@ -50,7 +52,13 @@ if [[ $# -lt 1 ]]; then
   exit 1
 fi
 
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+script_source="${BASH_SOURCE[0]}"
+while [[ -L "$script_source" ]]; do
+  script_source_dir="$(cd "$(dirname "$script_source")" && pwd)"
+  script_source="$(readlink "$script_source")"
+  [[ "$script_source" != /* ]] && script_source="$script_source_dir/$script_source"
+done
+script_dir="$(cd "$(dirname "$script_source")" && pwd)"
 load_env_file() {
   local env_file="$1" line key value
   while IFS= read -r line || [[ -n "$line" ]]; do
@@ -101,6 +109,8 @@ meta="${SHARE_META:-}"
 retry_count="${SHARE_RETRY_COUNT:-3}"
 retry_delay="${SHARE_RETRY_DELAY:-1}"
 retry_max_time="${SHARE_RETRY_MAX_TIME:-30}"
+multipart_threshold="${SHARE_MULTIPART_THRESHOLD:-4294967296}"
+part_size="${SHARE_PART_SIZE:-104857600}"
 progress_enabled=false
 if [[ -t 2 ]]; then
   progress_enabled=true
@@ -148,6 +158,14 @@ if ! [[ "$retry_delay" =~ ^[0-9]+$ ]]; then
 fi
 if ! [[ "$retry_max_time" =~ ^[0-9]+$ ]]; then
   echo "Error: SHARE_RETRY_MAX_TIME must be a non-negative integer." >&2
+  exit 1
+fi
+if ! [[ "$multipart_threshold" =~ ^[0-9]+$ ]]; then
+  echo "Error: SHARE_MULTIPART_THRESHOLD must be a non-negative integer." >&2
+  exit 1
+fi
+if ! [[ "$part_size" =~ ^[0-9]+$ ]] || [[ "$part_size" -lt 5242880 ]]; then
+  echo "Error: SHARE_PART_SIZE must be an integer >= 5242880 (5 MiB)." >&2
   exit 1
 fi
 
@@ -329,6 +347,68 @@ progress_tui() {
   printf "\n" >&2
 }
 
+# Renders an overall multi-part progress bar by reading curl --progress-bar
+# output for the current part and combining with bytes already uploaded.
+# Args: base_bytes this_part_size total_bytes part_num num_parts start_time
+multipart_progress_tui() {
+  local base_bytes="$1"
+  local this_part_size="$2"
+  local total_bytes_local="$3"
+  local part_num="$4"
+  local num_parts_local="$5"
+  local start_time="$6"
+
+  local now elapsed part_percent part_sent sent_bytes speed remaining eta
+  local overall_pct bar_width filled_count empty_count filled empty line
+  bar_width=30
+
+  while IFS= read -r -d $'\r' line || [[ -n "$line" ]]; do
+    line="${line//$'\n'/}"
+    if [[ "$line" =~ ([0-9]+(\.[0-9]+)?)% ]]; then
+      part_percent="${BASH_REMATCH[1]}"
+      part_sent="$(awk -v s="$this_part_size" -v p="$part_percent" 'BEGIN { printf "%.0f", s * p / 100 }')"
+      sent_bytes=$((base_bytes + part_sent))
+      [[ "$sent_bytes" -gt "$total_bytes_local" ]] && sent_bytes="$total_bytes_local"
+
+      now="$(date +%s)"
+      elapsed=$((now - start_time))
+      [[ "$elapsed" -lt 1 ]] && elapsed=1
+
+      speed="$(awk -v b="$sent_bytes" -v t="$elapsed" 'BEGIN { printf "%.0f", b / t }')"
+      remaining=$((total_bytes_local - sent_bytes))
+      [[ "$remaining" -lt 0 ]] && remaining=0
+      if [[ "$speed" -gt 0 ]]; then
+        eta=$((remaining / speed))
+      else
+        eta=0
+      fi
+
+      overall_pct="$(awk -v s="$sent_bytes" -v t="$total_bytes_local" 'BEGIN { printf "%.1f", (s/t)*100 }')"
+      filled_count="$(awk -v p="$overall_pct" -v w="$bar_width" 'BEGIN { printf "%d", (p/100)*w }')"
+      [[ "$filled_count" -lt 0 ]] && filled_count=0
+      [[ "$filled_count" -gt "$bar_width" ]] && filled_count="$bar_width"
+      empty_count=$((bar_width - filled_count))
+
+      if [[ "$filled_count" -gt 0 ]]; then
+        filled="$(printf '\xe2\x96\x88%.0s' $(seq 1 "$filled_count"))"
+      else
+        filled=""
+      fi
+      if [[ "$empty_count" -gt 0 ]]; then
+        empty="$(printf '\xe2\x96\x91%.0s' $(seq 1 "$empty_count"))"
+      else
+        empty=""
+      fi
+
+      printf "\r%s%s %5.1f%%  Part %d/%d  %s / %s  %s  ETA %s   " \
+        "$filled" "$empty" "$overall_pct" \
+        "$part_num" "$num_parts_local" \
+        "$(format_bytes "$sent_bytes")" "$(format_bytes "$total_bytes_local")" \
+        "$(format_speed "$speed")" "$(format_eta "$eta")" >&2
+    fi
+  done
+}
+
 http_head_status() {
   local url="$1" status curl_status
   set +e
@@ -414,9 +494,220 @@ preflight_check() {
   fi
 }
 
-payload_hash="$(openssl dgst -sha256 "$path" | awk '{print $2}')"
-amz_date="$(date -u +"%Y%m%dT%H%M%SZ")"
-date_stamp="$(date -u +"%Y%m%d")"
+hmac_sha256_hex() {
+  local key="$1"
+  local data="$2"
+  local key_type="${3:-str}"
+  if [[ "$key_type" == "hex" ]]; then
+    printf '%b' "$data" | openssl dgst -sha256 -mac HMAC -macopt hexkey:"$key" | awk '{print $2}'
+  else
+    printf '%b' "$data" | openssl dgst -sha256 -mac HMAC -macopt key:"$key" | awk '{print $2}'
+  fi
+}
+
+# Compute SigV4 signature for an S3 request and build the curl headers array.
+# Sets globals: amz_date, curl_headers (array).
+# Args: method canonical_uri canonical_query payload_hash [extra "name:value" header...]
+sign_request() {
+  local method="$1" cu="$2" cq="$3" ph="$4"
+  shift 4
+
+  amz_date="$(date -u +"%Y%m%dT%H%M%SZ")"
+  local date_stamp credential_scope
+  date_stamp="$(date -u +"%Y%m%d")"
+  credential_scope="${date_stamp}/${region}/s3/aws4_request"
+
+  local entries=(
+    "host:${host_for_sig}"
+    "x-amz-content-sha256:${ph}"
+    "x-amz-date:${amz_date}"
+  )
+  if [[ -n "${session_token_norm:-}" ]]; then
+    entries+=("x-amz-security-token:${session_token_norm}")
+  fi
+  local h
+  if [[ $# -gt 0 ]]; then
+    for h in "$@"; do
+      entries+=("$h")
+    done
+  fi
+
+  build_canonical_headers "${entries[@]}"
+
+  local canonical_request canonical_request_hash string_to_sign
+  canonical_request="${method}\n${cu}\n${cq}\n${canonical_headers}\n\n${signed_headers}\n${ph}"
+  canonical_request_hash="$(printf '%b' "$canonical_request" | openssl dgst -sha256 | awk '{print $2}')"
+  string_to_sign="AWS4-HMAC-SHA256\n${amz_date}\n${credential_scope}\n${canonical_request_hash}"
+
+  local k_date k_region k_service k_signing signature
+  k_date="$(hmac_sha256_hex "AWS4${secret_key}" "$date_stamp" "str")"
+  k_region="$(hmac_sha256_hex "$k_date" "$region" "hex")"
+  k_service="$(hmac_sha256_hex "$k_region" "s3" "hex")"
+  k_signing="$(hmac_sha256_hex "$k_service" "aws4_request" "hex")"
+  signature="$(hmac_sha256_hex "$k_signing" "$string_to_sign" "hex")"
+
+  local authorization_header
+  authorization_header="AWS4-HMAC-SHA256 Credential=${access_key}/${credential_scope}, SignedHeaders=${signed_headers}, Signature=${signature}"
+
+  curl_headers=(
+    -H "Authorization: ${authorization_header}"
+    -H "x-amz-content-sha256: ${ph}"
+    -H "x-amz-date: ${amz_date}"
+  )
+  if [[ -n "${session_token_norm:-}" ]]; then
+    curl_headers+=(-H "x-amz-security-token: ${session_token_norm}")
+  fi
+  if [[ $# -gt 0 ]]; then
+    for h in "$@"; do
+      curl_headers+=(-H "${h%%:*}: ${h#*:}")
+    done
+  fi
+
+  if $debug; then
+    {
+      echo "=== sign_request DEBUG ==="
+      echo "Method: ${method}"
+      echo "Canonical URI: ${cu}"
+      echo "Canonical Query: ${cq}"
+      echo "Date: ${amz_date}"
+      echo "Payload hash: ${ph}"
+      echo "--- Canonical Request ---"
+      printf '%b\n' "$canonical_request"
+      echo "--- End Canonical Request ---"
+      echo "Canonical Request Hash: ${canonical_request_hash}"
+      echo "--- String to Sign ---"
+      printf '%b\n' "$string_to_sign"
+      echo "--- End String to Sign ---"
+      echo "Signature: ${signature}"
+      echo "Authorization: ${authorization_header}"
+      echo "=========================="
+    } >&2
+  fi
+}
+
+empty_sha256="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+# CreateMultipartUpload. Echoes UploadId on success.
+# Args: [extra "name:value" headers attached to the object...]
+create_multipart() {
+  sign_request "POST" "$canonical_uri" "uploads=" "$empty_sha256" "$@"
+  local resp_file status cs
+  resp_file="$(mktemp)"
+  set +e
+  status="$(curl --silent --show-error --request POST "${upload_url}?uploads=" "${curl_headers[@]}" --data-binary "" --output "$resp_file" --write-out "%{http_code}")"
+  cs=$?
+  set -e
+  if [[ $cs -ne 0 || "$status" != "200" ]]; then
+    echo "Error: CreateMultipartUpload failed (curl=$cs http=$status)." >&2
+    [[ -s "$resp_file" ]] && cat "$resp_file" >&2
+    rm -f "$resp_file"
+    return 1
+  fi
+  local id
+  id="$(grep -oE '<UploadId>[^<]+</UploadId>' "$resp_file" | head -1 | sed -E 's|</?UploadId>||g')"
+  rm -f "$resp_file"
+  if [[ -z "$id" ]]; then
+    echo "Error: could not parse UploadId from CreateMultipartUpload response." >&2
+    return 1
+  fi
+  printf '%s' "$id"
+}
+
+# Upload one part. Echoes ETag (with quotes) on success.
+# Args: part_num upload_id chunk_file
+upload_part() {
+  local part_num="$1" upload_id="$2" chunk_path="$3"
+  local enc_id query request_url chunk_hash
+  enc_id="$(uri_encode "$upload_id")"
+  query="partNumber=${part_num}&uploadId=${enc_id}"
+  request_url="${upload_url}?${query}"
+  chunk_hash="$(openssl dgst -sha256 "$chunk_path" | awk '{print $2}')"
+  sign_request "PUT" "$canonical_uri" "$query" "$chunk_hash"
+
+  local hdr_file body_file status cs
+  hdr_file="$(mktemp)"
+  body_file="$(mktemp)"
+  set +e
+  if $progress_enabled && [[ -n "${mp_total_bytes:-}" ]]; then
+    status="$(curl --progress-bar --show-error --request PUT --upload-file "$chunk_path" "${request_url}" "${curl_headers[@]}" -D "$hdr_file" --output "$body_file" --write-out "%{http_code}" 2> >(multipart_progress_tui "$mp_base_bytes" "$mp_part_size_now" "$mp_total_bytes" "$part_num" "$mp_num_parts" "$mp_start_time"))"
+  else
+    status="$(curl --silent --show-error --request PUT --upload-file "$chunk_path" "${request_url}" "${curl_headers[@]}" -D "$hdr_file" --output "$body_file" --write-out "%{http_code}")"
+  fi
+  cs=$?
+  set -e
+  if [[ $cs -ne 0 || "$status" != "200" ]]; then
+    echo "Error: UploadPart $part_num failed (curl=$cs http=$status)." >&2
+    [[ -s "$body_file" ]] && cat "$body_file" >&2
+    rm -f "$hdr_file" "$body_file"
+    return 1
+  fi
+  local etag
+  etag="$(grep -iE '^etag:' "$hdr_file" | head -1 | sed -E 's/^[Ee][Tt][Aa][Gg]:[[:space:]]*//' | tr -d '\r\n')"
+  rm -f "$hdr_file" "$body_file"
+  if [[ -z "$etag" ]]; then
+    echo "Error: no ETag in UploadPart $part_num response." >&2
+    return 1
+  fi
+  printf '%s' "$etag"
+}
+
+# CompleteMultipartUpload.
+# Args: upload_id etag1 etag2 ... etagN   (in part order 1..N)
+complete_multipart() {
+  local upload_id="$1"
+  shift
+  local etags=("$@")
+  local body body_file body_hash enc_id query request_url
+  body="<CompleteMultipartUpload>"
+  local i
+  for ((i=0; i<${#etags[@]}; i++)); do
+    body+="<Part><PartNumber>$((i+1))</PartNumber><ETag>${etags[i]}</ETag></Part>"
+  done
+  body+="</CompleteMultipartUpload>"
+  body_file="$(mktemp)"
+  printf '%s' "$body" > "$body_file"
+  body_hash="$(openssl dgst -sha256 "$body_file" | awk '{print $2}')"
+  enc_id="$(uri_encode "$upload_id")"
+  query="uploadId=${enc_id}"
+  request_url="${upload_url}?${query}"
+  sign_request "POST" "$canonical_uri" "$query" "$body_hash"
+
+  local resp_file status cs
+  resp_file="$(mktemp)"
+  set +e
+  status="$(curl --silent --show-error --request POST "${request_url}" "${curl_headers[@]}" --data-binary "@$body_file" --output "$resp_file" --write-out "%{http_code}")"
+  cs=$?
+  set -e
+  rm -f "$body_file"
+  if [[ $cs -ne 0 || "$status" != "200" ]]; then
+    echo "Error: CompleteMultipartUpload failed (curl=$cs http=$status)." >&2
+    [[ -s "$resp_file" ]] && cat "$resp_file" >&2
+    rm -f "$resp_file"
+    return 1
+  fi
+  if grep -q '<Error>' "$resp_file"; then
+    echo "Error: CompleteMultipartUpload returned error body:" >&2
+    cat "$resp_file" >&2
+    rm -f "$resp_file"
+    return 1
+  fi
+  rm -f "$resp_file"
+}
+
+# AbortMultipartUpload (best-effort).
+# Args: upload_id
+abort_multipart() {
+  local upload_id="$1"
+  local enc_id query request_url
+  enc_id="$(uri_encode "$upload_id")"
+  query="uploadId=${enc_id}"
+  request_url="${upload_url}?${query}"
+  sign_request "DELETE" "$canonical_uri" "$query" "$empty_sha256"
+  curl --silent --show-error --max-time 15 --request DELETE "${request_url}" "${curl_headers[@]}" --output /dev/null || true
+}
+
+# ----- Main upload flow -----
+
 total_bytes="$(file_size "$path" 2>/dev/null || true)"
 if [[ -z "$total_bytes" ]]; then
   total_bytes=0
@@ -438,33 +729,28 @@ if [[ "$preflight" != "0" ]]; then
   preflight_check
 fi
 
-header_entries=(
-  "host:${host_for_sig}"
-  "x-amz-content-sha256:${payload_hash}"
-  "x-amz-date:${amz_date}"
-)
-
+# Normalize optional headers once; reused by single PUT and CreateMultipartUpload.
 session_token_norm=""
 content_type_norm=""
 cache_control_norm=""
 content_disposition_norm=""
 meta_headers=()
+extra_headers=()
 
 if [[ -n "$session_token" ]]; then
   session_token_norm="$(normalize_header_value "$session_token")"
-  header_entries+=("x-amz-security-token:${session_token_norm}")
 fi
 if [[ -n "$content_type" ]]; then
   content_type_norm="$(normalize_header_value "$content_type")"
-  header_entries+=("content-type:${content_type_norm}")
+  extra_headers+=("content-type:${content_type_norm}")
 fi
 if [[ -n "$cache_control" ]]; then
   cache_control_norm="$(normalize_header_value "$cache_control")"
-  header_entries+=("cache-control:${cache_control_norm}")
+  extra_headers+=("cache-control:${cache_control_norm}")
 fi
 if [[ -n "$content_disposition" ]]; then
   content_disposition_norm="$(normalize_header_value "$content_disposition")"
-  header_entries+=("content-disposition:${content_disposition_norm}")
+  extra_headers+=("content-disposition:${content_disposition_norm}")
 fi
 
 if [[ -n "$meta" ]]; then
@@ -495,119 +781,104 @@ if [[ -n "$meta" ]]; then
     meta_headers+=("x-amz-meta-${key_lc}:$(normalize_header_value "$value")")
   done
   if [[ ${#meta_headers[@]} -gt 0 ]]; then
-    header_entries+=("${meta_headers[@]}")
+    extra_headers+=("${meta_headers[@]}")
   fi
 fi
 
-build_canonical_headers "${header_entries[@]}"
-
-canonical_request="PUT\n${canonical_uri}\n\n${canonical_headers}\n\n${signed_headers}\n${payload_hash}"
-canonical_request_hash="$(printf '%b' "$canonical_request" | openssl dgst -sha256 | awk '{print $2}')"
-
-credential_scope="${date_stamp}/${region}/s3/aws4_request"
-string_to_sign="AWS4-HMAC-SHA256\n${amz_date}\n${credential_scope}\n${canonical_request_hash}"
-
-hmac_sha256_hex() {
-  local key="$1"
-  local data="$2"
-  local key_type="${3:-str}"
-  if [[ "$key_type" == "hex" ]]; then
-    printf '%b' "$data" | openssl dgst -sha256 -mac HMAC -macopt hexkey:"$key" | awk '{print $2}'
-  else
-    printf '%b' "$data" | openssl dgst -sha256 -mac HMAC -macopt key:"$key" | awk '{print $2}'
+# Cleanup state + trap so failed/interrupted multipart uploads are aborted.
+upload_id=""
+multipart_completed=0
+chunk_dir=""
+cleanup_handler() {
+  if [[ -n "$upload_id" && "$multipart_completed" -eq 0 ]]; then
+    echo "Aborting incomplete multipart upload..." >&2
+    abort_multipart "$upload_id" || true
+  fi
+  if [[ -n "$chunk_dir" && -d "$chunk_dir" ]]; then
+    rm -rf "$chunk_dir"
   fi
 }
+trap cleanup_handler EXIT
 
-k_date="$(hmac_sha256_hex "AWS4${secret_key}" "$date_stamp" "str")"
-k_region="$(hmac_sha256_hex "$k_date" "$region" "hex")"
-k_service="$(hmac_sha256_hex "$k_region" "s3" "hex")"
-k_signing="$(hmac_sha256_hex "$k_service" "aws4_request" "hex")"
-signature="$(hmac_sha256_hex "$k_signing" "$string_to_sign" "hex")"
+if [[ "$total_bytes" -gt "$multipart_threshold" ]]; then
+  # ----- Multipart upload path -----
+  num_parts=$(( (total_bytes + part_size - 1) / part_size ))
+  echo "Multipart upload: ${num_parts} parts of $(format_bytes "$part_size") (file: $(format_bytes "$total_bytes"))" >&2
 
-authorization_header="AWS4-HMAC-SHA256 Credential=${access_key}/${credential_scope}, SignedHeaders=${signed_headers}, Signature=${signature}"
+  upload_id="$(create_multipart ${extra_headers[@]+"${extra_headers[@]}"})"
+  if [[ -z "$upload_id" ]]; then
+    echo "Error: failed to start multipart upload." >&2
+    exit 1
+  fi
 
-if $debug; then
-  echo "=== DEBUG ===" >&2
-  echo "Upload URL: ${upload_url}" >&2
-  echo "Host for signature: ${host_for_sig}" >&2
-  echo "Canonical URI: ${canonical_uri}" >&2
-  echo "Date: ${amz_date}" >&2
-  echo "Payload hash: ${payload_hash}" >&2
-  echo "" >&2
-  echo "--- Canonical Request ---" >&2
-  printf '%b' "$canonical_request" >&2
-  echo "" >&2
-  echo "--- End Canonical Request ---" >&2
-  echo "" >&2
-  echo "Canonical Request Hash: ${canonical_request_hash}" >&2
-  echo "" >&2
-  echo "--- String to Sign ---" >&2
-  printf '%b' "$string_to_sign" >&2
-  echo "" >&2
-  echo "--- End String to Sign ---" >&2
-  echo "" >&2
-  echo "Signature: ${signature}" >&2
-  echo "Authorization: ${authorization_header}" >&2
-  echo "===============" >&2
-fi
-
-curl_headers=(
-  -H "Authorization: ${authorization_header}"
-  -H "x-amz-content-sha256: ${payload_hash}"
-  -H "x-amz-date: ${amz_date}"
-)
-if [[ -n "$session_token_norm" ]]; then
-  curl_headers+=(-H "x-amz-security-token: ${session_token_norm}")
-fi
-if [[ -n "$content_type_norm" ]]; then
-  curl_headers+=(-H "Content-Type: ${content_type_norm}")
-fi
-if [[ -n "$cache_control_norm" ]]; then
-  curl_headers+=(-H "Cache-Control: ${cache_control_norm}")
-fi
-if [[ -n "$content_disposition_norm" ]]; then
-  curl_headers+=(-H "Content-Disposition: ${content_disposition_norm}")
-fi
-if [[ ${#meta_headers[@]} -gt 0 ]]; then
-  for meta_header in "${meta_headers[@]}"; do
-    curl_headers+=(-H "${meta_header%%:*}: ${meta_header#*:}")
+  chunk_dir="$(mktemp -d)"
+  etags=()
+  mp_total_bytes="$total_bytes"
+  mp_num_parts="$num_parts"
+  mp_start_time="$(date +%s)"
+  mp_base_bytes=0
+  for ((i=1; i<=num_parts; i++)); do
+    if [[ "$i" -eq "$num_parts" ]]; then
+      mp_part_size_now=$(( total_bytes - (i - 1) * part_size ))
+    else
+      mp_part_size_now="$part_size"
+    fi
+    chunk_file="${chunk_dir}/part_${i}"
+    if ! dd if="$path" of="$chunk_file" bs="$part_size" skip=$((i - 1)) count=1 2>/dev/null; then
+      echo "Error: failed to extract chunk $i." >&2
+      exit 1
+    fi
+    etag="$(upload_part "$i" "$upload_id" "$chunk_file")"
+    rm -f "$chunk_file"
+    etags+=("$etag")
+    mp_base_bytes=$(( mp_base_bytes + mp_part_size_now ))
   done
-fi
+  printf "\n" >&2
 
-curl_retry_args=()
-if [[ "$retry_count" -gt 0 ]]; then
-  curl_retry_args=(--retry "$retry_count" --retry-delay "$retry_delay" --retry-max-time "$retry_max_time" --retry-connrefused)
-fi
-
-tmp_body="$(mktemp)"
-set +e
-if $progress_enabled; then
-  curl_output="$(curl --progress-bar --show-error --request PUT --upload-file "$path" "${upload_url}" "${curl_headers[@]}" "${curl_retry_args[@]}" --output "$tmp_body" --write-out "%{http_code}" 2> >(progress_tui "$total_bytes"))"
+  complete_multipart "$upload_id" ${etags[@]+"${etags[@]}"}
+  multipart_completed=1
+  rmdir "$chunk_dir" 2>/dev/null || true
+  chunk_dir=""
 else
-  curl_output="$(curl --silent --show-error --request PUT --upload-file "$path" "${upload_url}" "${curl_headers[@]}" "${curl_retry_args[@]}" --output "$tmp_body" --write-out "%{http_code}")"
-fi
-curl_status=$?
-set -e
-if [[ $curl_status -ne 0 ]]; then
-  echo "Error: upload failed (curl exit $curl_status)." >&2
-  if [[ -s "$tmp_body" ]]; then
-    echo "Response:" >&2
-    cat "$tmp_body" >&2
+  # ----- Single PUT path -----
+  payload_hash="$(openssl dgst -sha256 "$path" | awk '{print $2}')"
+  sign_request "PUT" "$canonical_uri" "" "$payload_hash" ${extra_headers[@]+"${extra_headers[@]}"}
+
+  curl_retry_args=()
+  if [[ "$retry_count" -gt 0 ]]; then
+    curl_retry_args=(--retry "$retry_count" --retry-delay "$retry_delay" --retry-max-time "$retry_max_time" --retry-connrefused)
+  fi
+
+  tmp_body="$(mktemp)"
+  set +e
+  if $progress_enabled; then
+    curl_output="$(curl --progress-bar --show-error --request PUT --upload-file "$path" "${upload_url}" "${curl_headers[@]}" "${curl_retry_args[@]}" --output "$tmp_body" --write-out "%{http_code}" 2> >(progress_tui "$total_bytes"))"
+  else
+    curl_output="$(curl --silent --show-error --request PUT --upload-file "$path" "${upload_url}" "${curl_headers[@]}" "${curl_retry_args[@]}" --output "$tmp_body" --write-out "%{http_code}")"
+  fi
+  curl_status=$?
+  set -e
+  if [[ $curl_status -ne 0 ]]; then
+    echo "Error: upload failed (curl exit $curl_status)." >&2
+    if [[ -s "$tmp_body" ]]; then
+      echo "Response:" >&2
+      cat "$tmp_body" >&2
+    fi
+    rm -f "$tmp_body"
+    exit "$curl_status"
+  fi
+  read -r http_code <<<"$curl_output"
+  if [[ "$http_code" != "200" ]]; then
+    echo "Error: upload failed (HTTP $http_code)." >&2
+    if [[ -s "$tmp_body" ]]; then
+      echo "Response:" >&2
+      cat "$tmp_body" >&2
+    fi
+    rm -f "$tmp_body"
+    exit 1
   fi
   rm -f "$tmp_body"
-  exit "$curl_status"
 fi
-read -r http_code <<<"$curl_output"
-if [[ "$http_code" != "200" ]]; then
-  echo "Error: upload failed (HTTP $http_code)." >&2
-  if [[ -s "$tmp_body" ]]; then
-    echo "Response:" >&2
-    cat "$tmp_body" >&2
-  fi
-  rm -f "$tmp_body"
-  exit 1
-fi
-rm -f "$tmp_body"
 
 # Print shareable URL.
 if [[ "$base_url" == */ ]]; then
