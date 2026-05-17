@@ -499,9 +499,9 @@ hmac_sha256_hex() {
   local data="$2"
   local key_type="${3:-str}"
   if [[ "$key_type" == "hex" ]]; then
-    printf '%b' "$data" | openssl dgst -sha256 -mac HMAC -macopt hexkey:"$key" | awk '{print $2}'
+    printf '%b' "$data" | openssl dgst -sha256 -mac HMAC -macopt hexkey:"$key" | awk '{print $NF}'
   else
-    printf '%b' "$data" | openssl dgst -sha256 -mac HMAC -macopt key:"$key" | awk '{print $2}'
+    printf '%b' "$data" | openssl dgst -sha256 -mac HMAC -macopt key:"$key" | awk '{print $NF}'
   fi
 }
 
@@ -536,7 +536,7 @@ sign_request() {
 
   local canonical_request canonical_request_hash string_to_sign
   canonical_request="${method}\n${cu}\n${cq}\n${canonical_headers}\n\n${signed_headers}\n${ph}"
-  canonical_request_hash="$(printf '%b' "$canonical_request" | openssl dgst -sha256 | awk '{print $2}')"
+  canonical_request_hash="$(printf '%b' "$canonical_request" | openssl dgst -sha256 | awk '{print $NF}')"
   string_to_sign="AWS4-HMAC-SHA256\n${amz_date}\n${credential_scope}\n${canonical_request_hash}"
 
   local k_date k_region k_service k_signing signature
@@ -621,7 +621,7 @@ upload_part() {
   enc_id="$(uri_encode "$upload_id")"
   query="partNumber=${part_num}&uploadId=${enc_id}"
   request_url="${upload_url}?${query}"
-  chunk_hash="$(openssl dgst -sha256 "$chunk_path" | awk '{print $2}')"
+  chunk_hash="$(openssl dgst -sha256 "$chunk_path" | awk '{print $NF}')"
   sign_request "PUT" "$canonical_uri" "$query" "$chunk_hash"
 
   local hdr_file body_file status cs
@@ -666,7 +666,7 @@ complete_multipart() {
   body+="</CompleteMultipartUpload>"
   body_file="$(mktemp)"
   printf '%s' "$body" > "$body_file"
-  body_hash="$(openssl dgst -sha256 "$body_file" | awk '{print $2}')"
+  body_hash="$(openssl dgst -sha256 "$body_file" | awk '{print $NF}')"
   enc_id="$(uri_encode "$upload_id")"
   query="uploadId=${enc_id}"
   request_url="${upload_url}?${query}"
@@ -841,7 +841,7 @@ if [[ "$total_bytes" -gt "$multipart_threshold" ]]; then
   chunk_dir=""
 else
   # ----- Single PUT path -----
-  payload_hash="$(openssl dgst -sha256 "$path" | awk '{print $2}')"
+  payload_hash="$(openssl dgst -sha256 "$path" | awk '{print $NF}')"
   sign_request "PUT" "$canonical_uri" "" "$payload_hash" ${extra_headers[@]+"${extra_headers[@]}"}
 
   curl_retry_args=()
