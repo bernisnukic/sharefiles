@@ -336,7 +336,7 @@ progress_tui() {
       empty_count=$((bar_width - filled_count))
       filled="$(printf '%*s' "$filled_count" '' | tr ' ' '=')"
       empty="$(printf '%*s' "$empty_count" '' | tr ' ' '-')"
-      printf "\rUPLOAD [%s%s] %5.1f%%  %s / %s  %s  ETA %s" \
+      printf "\rUPLOAD [%s%s] %5.1f%%  %s / %s  %s  ETA %s\033[K" \
         "$filled" "$empty" "$percent" \
         "$(format_bytes "$sent_bytes")" "$(format_bytes "$total_bytes")" \
         "$(format_speed "$speed")" "$(format_eta "$eta")" >&2
@@ -400,7 +400,7 @@ multipart_progress_tui() {
         empty=""
       fi
 
-      printf "\r%s%s %5.1f%%  Part %d/%d  %s / %s  %s  ETA %s   " \
+      printf "\r%s%s %5.1f%%  Part %d/%d  %s / %s  %s  ETA %s\033[K" \
         "$filled" "$empty" "$overall_pct" \
         "$part_num" "$num_parts_local" \
         "$(format_bytes "$sent_bytes")" "$(format_bytes "$total_bytes_local")" \
